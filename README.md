@@ -17,7 +17,7 @@ Averages two masks in regions where they overlap.
 | `mask_a` / `mask_b` | Input masks (2D or batched 3D) |
 | `presence_threshold` | Minimum value to consider a pixel "present" (default `0.01`). Raise to ignore soft edges; set to `0` for strict non-zero behavior. |
 
-### Directional Blur
+### Directional Mask Blur
 
 Applies a directional Gaussian blur to a mask, useful for feathering edges in a specific direction.
 

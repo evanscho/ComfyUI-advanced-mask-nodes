@@ -13,9 +13,9 @@ class DirectionalBlur:
     blur cone is – 360° gives a standard omnidirectional Gaussian blur while
     smaller values restrict blur to a narrower wedge.
 
-    When ``preserve_interior`` is True the result is clamped with
-    ``max(blurred, original)`` so the mask interior stays at 1.0, giving
-    outward-only feathering.
+    ``preserve_interior`` (0.0–1.0) controls how much of the original mask
+    interior is kept after blurring.  At 1.0 the interior stays fully opaque,
+    giving outward-only feathering.  At 0.0 the blur is unrestricted.
     """
 
     @classmethod
@@ -35,7 +35,16 @@ class DirectionalBlur:
                     "INT",
                     {"default": 10, "min": 0, "max": 256, "step": 1},
                 ),
-                "preserve_interior": ("BOOLEAN", {"default": True}),
+                "preserve_interior": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05},
+                ),
+                "single_pass": ("BOOLEAN", {"default": False}),
+                "soft_cone": ("BOOLEAN", {"default": True}),
+                "edge_padding": (
+                    ["replicate", "reflect", "zero"],
+                    {"default": "replicate"},
+                ),
             }
         }
 
@@ -56,23 +65,36 @@ class DirectionalBlur:
         radius: int,
         angle_deg: float,
         spread_deg: float,
-    ) -> torch.Tensor:
+        soft_cone: bool = True,
+    ) -> tuple:
         """Return a 2-D Gaussian kernel masked to an angular cone.
 
         Parameters
         ----------
         radius : int
-            Half-size of the kernel.  Full kernel is ``(2*radius+1)²``.
+            Blur strength.  Interpreted as sigma (standard deviation) in
+            pixels, matching modern Pillow / MaskGrow.  The kernel is
+            automatically sized to cover 3σ.
         angle_deg : float
             Centre direction of the blur cone in degrees (0° = up, clockwise).
         spread_deg : float
             Angular width of the cone in degrees.  360° keeps the full kernel.
+
+        Returns
+        -------
+        kernel : Tensor
+            Normalised 2-D kernel.
+        kern_radius : int
+            Actual half-size of the kernel.
         """
-        size = 2 * radius + 1
-        sigma = radius / 3.0  # 99.7 % of energy within kernel
+        # σ = radius (matches Pillow ≥11).  Kernel extends to 3σ.
+        sigma = float(radius)
+        kern_radius = math.ceil(3.0 * sigma)
+
+        size = 2 * kern_radius + 1
 
         # Co-ordinate grids centred on the kernel middle.
-        ax = torch.arange(size, dtype=torch.float32) - radius
+        ax = torch.arange(size, dtype=torch.float32) - kern_radius
         yy, xx = torch.meshgrid(ax, ax, indexing="ij")
 
         # --- Gaussian envelope ---
@@ -97,29 +119,57 @@ class DirectionalBlur:
             diff = torch.atan2(torch.sin(diff), torch.cos(diff))
 
             half_spread_rad = math.radians(spread_deg / 2.0)
-            angular_mask = (diff.abs() <= half_spread_rad).float()
+
+            if soft_cone:
+                # Cosine-tapered angular falloff: full weight in the inner
+                # half of the cone, smooth taper to zero in the outer half.
+                abs_diff = diff.abs()
+                inner_rad = half_spread_rad * 0.5
+                angular_mask = torch.where(
+                    abs_diff <= inner_rad,
+                    torch.ones_like(abs_diff),
+                    torch.where(
+                        abs_diff <= half_spread_rad,
+                        0.5 * (1.0 + torch.cos(
+                            math.pi * (abs_diff - inner_rad)
+                            / (half_spread_rad - inner_rad)
+                        )),
+                        torch.zeros_like(abs_diff),
+                    ),
+                )
+            else:
+                angular_mask = (diff.abs() <= half_spread_rad).float()
 
             # Always keep the centre pixel.
-            angular_mask[radius, radius] = 1.0
+            angular_mask[kern_radius, kern_radius] = 1.0
 
             kernel = kernel * angular_mask
 
         # Normalise so the kernel sums to 1.
         kernel = kernel / kernel.sum()
-        return kernel
+
+        return kernel, kern_radius
 
     # ------------------------------------------------------------------
     # Single-pass convolution helper
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _apply_kernel(mask: torch.Tensor, kernel: torch.Tensor, radius: int) -> torch.Tensor:
+    def _apply_kernel(
+        mask: torch.Tensor,
+        kernel: torch.Tensor,
+        radius: int,
+        edge_padding: str = "replicate",
+    ) -> torch.Tensor:
         """Convolve *mask* (B, H, W) with a prepared (1,1,K,K) kernel."""
+        mode = "constant" if edge_padding == "zero" else edge_padding
+        pad_args: dict = {"mode": mode}
+        if mode == "constant":
+            pad_args["value"] = 0.0
         padded = F.pad(
             mask.unsqueeze(1),
             (radius, radius, radius, radius),
-            mode="constant",
-            value=0.0,
+            **pad_args,
         )
         return F.conv2d(padded, kernel, padding=0).squeeze(1)
 
@@ -133,7 +183,10 @@ class DirectionalBlur:
         angle_deg: float,
         spread_deg: float,
         radius: int,
-        preserve_interior: bool,
+        preserve_interior: float,
+        single_pass: bool,
+        soft_cone: bool = True,
+        edge_padding: str = "replicate",
     ):
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
@@ -142,15 +195,14 @@ class DirectionalBlur:
         if radius <= 0:
             return (mask,)
 
-        # Split into multiple passes when radius exceeds the cap.
-        # Each pass uses a smaller kernel; repeated application compounds
-        # into the equivalent of a large Gaussian (variances add).
-        cap = self._MAX_SINGLE_RADIUS
-        if radius <= cap:
+        # When single_pass is True, use one kernel of the full radius.
+        # Otherwise split into multiple passes to keep memory bounded.
+        if single_pass or radius <= self._MAX_SINGLE_RADIUS:
             passes = [radius]
         else:
             # Distribute into equal-ish passes whose variances sum to the
             # target variance:  n * sigma_small^2 = sigma_total^2
+            cap = self._MAX_SINGLE_RADIUS
             n_passes = math.ceil(radius / cap)
             # sigma_small = sigma_total / sqrt(n_passes)
             # radius_small = sigma_small * 3
@@ -160,20 +212,25 @@ class DirectionalBlur:
 
         result = mask
         for r in passes:
-            kernel = self._build_directional_kernel(r, angle_deg, spread_deg)
+            kernel, kern_radius = self._build_directional_kernel(
+                r, angle_deg, spread_deg, soft_cone,
+            )
             kernel = kernel.unsqueeze(0).unsqueeze(0).to(mask.device, dtype=mask.dtype)
-            result = self._apply_kernel(result, kernel, r)
+            result = self._apply_kernel(result, kernel, kern_radius, edge_padding)
 
-        if preserve_interior:
-            result = torch.maximum(result, mask)
+        if preserve_interior > 0.0:
+            # Blend: at 1.0, fully clamp to original where it was brighter;
+            # at fractional values, partially restore the original.
+            diff = torch.clamp(mask - result, min=0.0)
+            result = result + preserve_interior * diff
 
         return (result.clamp(0.0, 1.0),)
 
 
 NODE_CLASS_MAPPINGS = {
-    "Directional Blur": DirectionalBlur,
+    "Directional Mask Blur": DirectionalBlur,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Directional Blur": "Directional Blur",
+    "Directional Mask Blur": "Directional Mask Blur",
 }
