@@ -99,7 +99,7 @@ def test_presence_threshold_zero_strict(node):
     b = torch.zeros(1, 64, 64)
     a[:, :, :] = 0.005
     b[:, :, :] = 0.8
-    (result,) = node.average_masks(a, b, presence_threshold=0.0)
+    (result,) = node.average_masks(a, b, presence_threshold=0.0, blend_threshold=0.0)
     # Both present → averaged
     expected = (0.005 + 0.8) / 2.0
     assert torch.allclose(result, torch.full((1, 64, 64), expected))

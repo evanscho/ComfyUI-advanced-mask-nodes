@@ -6,9 +6,17 @@ import torch
 class AverageOverlappingMasks:
     """Average two masks in regions where they overlap.
 
-    Where both masks have non-zero values the output is the element-wise
-    average.  Where only one mask is non-zero the output equals that mask's
+    Where both masks exceed ``blend_threshold`` the output is the
+    element-wise average.  Where only one mask exceeds it (but both
+    are above ``presence_threshold``) the output equals that mask's
     value.  Where neither mask is present the output is zero.
+
+    ``presence_threshold`` – minimum value for a pixel to count as
+    'present' (not empty).
+
+    ``blend_threshold`` – minimum value for a pixel to participate in
+    averaging.  Pixels between the two thresholds are present but
+    passed through without blending.
     """
 
     @classmethod
@@ -25,6 +33,15 @@ class AverageOverlappingMasks:
                     "tooltip": "Minimum value for a pixel to be considered 'present' in a mask. "
                                "Raise to ignore soft edges; set to 0 for strict non-zero behavior.",
                 }),
+                "blend_threshold": ("FLOAT", {
+                    "default": 0.01,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Minimum value for a pixel to participate in averaging. "
+                               "Pixels between presence and blend thresholds are present "
+                               "but passed through without blending.",
+                }),
             }
         }
 
@@ -33,7 +50,8 @@ class AverageOverlappingMasks:
     CATEGORY = "mask"
 
     def average_masks(self, mask_a: torch.Tensor, mask_b: torch.Tensor,
-                      presence_threshold: float = 0.01) -> tuple[torch.Tensor]:
+                      presence_threshold: float = 0.01,
+                      blend_threshold: float = 0.01) -> tuple[torch.Tensor]:
         # Normalise to (B, H, W)
         if mask_a.dim() == 2:
             mask_a = mask_a.unsqueeze(0)
@@ -56,12 +74,23 @@ class AverageOverlappingMasks:
 
         a_present = mask_a > presence_threshold
         b_present = mask_b > presence_threshold
-        both = a_present & b_present
+        a_blendable = mask_a > blend_threshold
+        b_blendable = mask_b > blend_threshold
+
+        # Both above blend threshold → average.
+        both_blend = a_blendable & b_blendable
 
         result = torch.zeros_like(mask_a)
-        result[both] = (mask_a[both] + mask_b[both]) / 2.0
-        result[a_present & ~b_present] = mask_a[a_present & ~b_present]
-        result[~a_present & b_present] = mask_b[~a_present & b_present]
+        result[both_blend] = (mask_a[both_blend] + mask_b[both_blend]) / 2.0
+
+        # Present but not blended: pass through whichever is present.
+        a_only = a_present & ~both_blend
+        b_only = b_present & ~both_blend
+        result[a_only] = mask_a[a_only]
+        # Where b_only overlaps with a_only, take whichever is larger.
+        overlap = a_only & b_only
+        result[overlap] = torch.maximum(mask_a[overlap], mask_b[overlap])
+        result[b_only & ~a_only] = mask_b[b_only & ~a_only]
 
         return (result.clamp(0.0, 1.0),)
 
