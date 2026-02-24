@@ -6,12 +6,27 @@ import torch.nn.functional as F
 
 
 class DirectionalBlur:
-    """Applies Gaussian blur to a mask restricted to a configurable angular cone.
+    """Directional mask blur via gradient blending.
 
-    The blur direction is controlled by ``angle_deg`` (compass-style: 0° = up,
-    90° = right, 180° = down, 270° = left).  ``spread_deg`` sets how wide the
-    blur cone is – 360° gives a standard omnidirectional Gaussian blur while
-    smaller values restrict blur to a narrower wedge.
+    Computes a full omnidirectional Gaussian blur (identical to MaskGrow /
+    PIL ``GaussianBlur``), then blends between the blurred result and the
+    original mask using a per-pixel weight that varies along the direction
+    specified by ``angle_deg``.
+
+    The side of the mask facing ``angle_deg`` receives full blur while the
+    opposite side stays sharp, with a smooth gradient between.
+
+    Two blend modes are available:
+
+    * **bbox** – projects each pixel onto the ``angle_deg`` axis relative
+      to the mask's bounding-box centre and normalises by the bounding-box
+      extent.  Fast and simple.
+
+    * **sdf** – uses a signed-distance field from the mask boundary to
+      weight the blend.  Each boundary pixel's position is projected onto
+      the ``angle_deg`` axis, producing a weight map that adapts precisely
+      to the mask shape.  More expensive but handles irregular masks
+      better.
     """
 
     @classmethod
@@ -23,19 +38,26 @@ class DirectionalBlur:
                     "FLOAT",
                     {"default": 180.0, "min": 0.0, "max": 360.0, "step": 1.0},
                 ),
-                "spread_deg": (
-                    "FLOAT",
-                    {"default": 350.0, "min": 10.0, "max": 360.0, "step": 1.0},
-                ),
                 "radius": (
                     "INT",
                     {"default": 10, "min": 0, "max": 256, "step": 1},
                 ),
+                "blend_mode": (
+                    ["bbox", "sdf"],
+                    {"default": "bbox"},
+                ),
+                "falloff": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.1},
+                ),
                 "single_pass": ("BOOLEAN", {"default": False}),
-                "soft_cone": ("BOOLEAN", {"default": True}),
                 "edge_padding": (
                     ["replicate", "reflect", "zero"],
                     {"default": "replicate"},
+                ),
+                "sdf_iterations": (
+                    "INT",
+                    {"default": 30, "min": 5, "max": 200, "step": 5},
                 ),
             }
         }
@@ -44,47 +66,15 @@ class DirectionalBlur:
     FUNCTION = "directional_blur"
     CATEGORY = "mask"
 
-    # Maximum single-pass kernel radius.  Larger requested radii are
-    # achieved via multiple passes, keeping memory and compute bounded.
     _MAX_SINGLE_RADIUS = 15
 
     # ------------------------------------------------------------------
-    # Kernel helpers
+    # Gaussian blur helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_directional_kernel(
-        radius: int,
-        angle_deg: float,
-        spread_deg: float,
-        soft_cone: bool = True,
-    ) -> tuple:
-        """Return a 2-D Gaussian kernel masked to an angular cone.
-
-        The full Gaussian is normalised to sum to 1.0 first, then the
-        angular mask is applied *without* re-normalising.  This means
-        cone-direction weights stay at their natural Gaussian strength,
-        and the kernel sums to less than 1.0 for sub-360° spreads.
-        The missing energy naturally preserves the original value in
-        non-cone directions.
-
-        Parameters
-        ----------
-        radius : int
-            Blur strength (sigma in pixels, matching Pillow ≥ 11).
-        angle_deg : float
-            Centre direction of the blur cone (0° = up, clockwise).
-        spread_deg : float
-            Angular width of the cone.  360° keeps the full kernel.
-
-        Returns
-        -------
-        kernel : Tensor
-            2-D kernel.
-        kern_radius : int
-            Half-size of the kernel.
-        """
-        # σ = radius (matches Pillow ≥11).  Kernel extends to 3σ.
+    def _build_gaussian_kernel(radius: int) -> tuple:
+        """Return an omnidirectional normalised 2-D Gaussian kernel."""
         sigma = float(radius)
         kern_radius = math.ceil(3.0 * sigma)
 
@@ -97,63 +87,7 @@ class DirectionalBlur:
         # --- Gaussian envelope, normalised to 1.0 ---
         kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2))
         kernel = kernel / kernel.sum()
-
-        # --- Angular mask ---
-        if spread_deg < 360.0:
-            # In convolution, to blur *toward* a direction we must keep the
-            # kernel weights on the *opposite* side (they "reach back" to
-            # collect values from the source region).  Negating the
-            # direction vector achieves this.
-            angle_rad = math.radians(angle_deg % 360.0)
-            dir_x = -math.sin(angle_rad)
-            dir_y = math.cos(angle_rad)
-
-            # Angle of each kernel pixel relative to centre.
-            pixel_angles = torch.atan2(xx, -yy)  # same convention: 0° = up
-            direction_angle = math.atan2(dir_x, -dir_y)
-
-            # Angular difference wrapped to [-π, π].
-            diff = pixel_angles - direction_angle
-            diff = torch.atan2(torch.sin(diff), torch.cos(diff))
-
-            half_spread_rad = math.radians(spread_deg / 2.0)
-
-            if soft_cone:
-                # Cosine-tapered angular falloff: full weight in the inner
-                # half of the cone, smooth taper to zero in the outer half.
-                abs_diff = diff.abs()
-                inner_rad = half_spread_rad * 0.5
-                angular_mask = torch.where(
-                    abs_diff <= inner_rad,
-                    torch.ones_like(abs_diff),
-                    torch.where(
-                        abs_diff <= half_spread_rad,
-                        0.5 * (1.0 + torch.cos(
-                            math.pi * (abs_diff - inner_rad)
-                            / (half_spread_rad - inner_rad)
-                        )),
-                        torch.zeros_like(abs_diff),
-                    ),
-                )
-            else:
-                angular_mask = (diff.abs() <= half_spread_rad).float()
-
-            # Always keep the centre pixel.
-            angular_mask[kern_radius, kern_radius] = 1.0
-
-            kernel = kernel * angular_mask
-
-        # Re-normalise so the kernel sums to 1.0.  This ensures flat
-        # regions are unchanged and the blur energy is concentrated
-        # into the cone direction — giving stronger directional reach
-        # without dimming the interior.
-        kernel = kernel / kernel.sum()
-
         return kernel, kern_radius
-
-    # ------------------------------------------------------------------
-    # Single-pass convolution helper
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _apply_kernel(
@@ -162,7 +96,7 @@ class DirectionalBlur:
         radius: int,
         edge_padding: str = "replicate",
     ) -> torch.Tensor:
-        """Convolve *mask* (B, H, W) with a prepared (1,1,K,K) kernel."""
+        """Convolve *mask* (B, H, W) with a (1,1,K,K) kernel."""
         mode = "constant" if edge_padding == "zero" else edge_padding
         pad_args: dict = {"mode": mode}
         if mode == "constant":
@@ -175,6 +109,185 @@ class DirectionalBlur:
         return F.conv2d(padded, kernel, padding=0).squeeze(1)
 
     # ------------------------------------------------------------------
+    # Blend-weight helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _blend_weight_bbox(
+        mask: torch.Tensor,
+        angle_deg: float,
+    ) -> torch.Tensor:
+        """Per-pixel blend weight based on bounding-box projection.
+
+        For each batch element, projects pixel positions onto the
+        ``angle_deg`` axis relative to the mask's bounding-box centre,
+        normalised by the mask extent along that axis.  Returns a weight
+        map in [0, 1] where 1 = fully blurred (leading edge) and 0 =
+        original (trailing edge).
+        """
+        B, H, W = mask.shape
+        angle_rad = math.radians(angle_deg % 360.0)
+        # Direction vector (0° = up → dy=-1, dx=0).
+        dx = math.sin(angle_rad)
+        dy = -math.cos(angle_rad)
+
+        # Pixel coordinate grids.
+        ys = torch.arange(H, dtype=mask.dtype, device=mask.device)
+        xs = torch.arange(W, dtype=mask.dtype, device=mask.device)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+
+        weight = torch.zeros_like(mask)
+
+        for b in range(B):
+            # Find bounding box of non-zero pixels.
+            nz = mask[b] > 0.01
+            if not nz.any():
+                continue
+
+            nz_y, nz_x = torch.where(nz)
+            cy = (nz_y.float().min() + nz_y.float().max()) / 2.0
+            cx = (nz_x.float().min() + nz_x.float().max()) / 2.0
+
+            # Project each pixel position onto the direction axis,
+            # relative to the bounding-box centre.
+            proj = (grid_x - cx) * dx + (grid_y - cy) * dy
+
+            # Project all mask pixels to find the extent.
+            mask_proj = (nz_x.float() - cx) * dx + (nz_y.float() - cy) * dy
+            proj_min = mask_proj.min()
+            proj_max = mask_proj.max()
+            extent = proj_max - proj_min
+            if extent < 1.0:
+                extent = 1.0
+
+            # Normalise: leading edge (max projection) → 1, trailing → 0.
+            w = (proj - proj_min) / extent
+            weight[b] = w.clamp(0.0, 1.0)
+
+        return weight
+
+    @staticmethod
+    def _blend_weight_sdf(
+        mask: torch.Tensor,
+        angle_deg: float,
+        blur_radius: int,
+        sdf_iterations: int = 30,
+    ) -> torch.Tensor:
+        """Per-pixel blend weight based on a signed-distance field.
+
+        Computes the distance from each pixel to the nearest mask
+        boundary pixel, then weights by the boundary pixel's position
+        projected onto the ``angle_deg`` axis.  Pixels near boundary
+        regions that face the angle get weight → 1 (blurred), those near
+        the opposite boundary get weight → 0 (original).
+        """
+        B, H, W = mask.shape
+        angle_rad = math.radians(angle_deg % 360.0)
+        dx = math.sin(angle_rad)
+        dy = -math.cos(angle_rad)
+
+        weight = torch.zeros_like(mask)
+
+        for b in range(B):
+            m = mask[b]
+
+            # Find boundary pixels via dilation - erosion.
+            m_4d = m.unsqueeze(0).unsqueeze(0)
+            dilated = F.max_pool2d(m_4d, kernel_size=3, stride=1, padding=1)
+            eroded = -F.max_pool2d(-m_4d, kernel_size=3, stride=1, padding=1)
+            boundary = ((dilated - eroded) > 0.01).squeeze()
+
+            if not boundary.any():
+                # No boundary → uniform mask, weight = 0.5 everywhere.
+                weight[b] = 0.5
+                continue
+
+            bnd_y, bnd_x = torch.where(boundary)
+            bnd_y = bnd_y.float()
+            bnd_x = bnd_x.float()
+
+            # Centre of the boundary.
+            cy = (bnd_y.min() + bnd_y.max()) / 2.0
+            cx = (bnd_x.min() + bnd_x.max()) / 2.0
+
+            # Project boundary pixels onto the angle axis.
+            bnd_proj = (bnd_x - cx) * dx + (bnd_y - cy) * dy
+            proj_min = bnd_proj.min()
+            proj_max = bnd_proj.max()
+            extent = proj_max - proj_min
+            if extent < 1.0:
+                extent = 1.0
+
+            # Normalise boundary projections to [0, 1].
+            bnd_weight = ((bnd_proj - proj_min) / extent).clamp(0.0, 1.0)
+
+            # For each pixel, find the nearest boundary pixel and use
+            # that boundary pixel's directional weight.
+            # To keep this tractable, use a distance-transform-like
+            # approach: iteratively propagate boundary weights outward.
+            # sdf_iterations controls how far the propagation reaches:
+            # low values → only near-boundary pixels get directional
+            # blending; high values → full propagation across the mask.
+            spread = sdf_iterations
+            w = torch.full((H, W), 0.5, dtype=mask.dtype, device=mask.device)
+            dist = torch.full((H, W), float("inf"), dtype=mask.dtype, device=mask.device)
+
+            # Seed boundary pixels.
+            dist[boundary] = 0.0
+            w[boundary] = bnd_weight.to(mask.dtype)
+
+            # Iterative propagation (like a BFS distance transform).
+            for _ in range(spread):
+                # Pad dist and w for 3x3 neighbourhood.
+                d_pad = F.pad(
+                    dist.unsqueeze(0).unsqueeze(0),
+                    (1, 1, 1, 1),
+                    mode="replicate",
+                ).squeeze()
+                w_pad = F.pad(
+                    w.unsqueeze(0).unsqueeze(0),
+                    (1, 1, 1, 1),
+                    mode="replicate",
+                ).squeeze()
+
+                # Check all 8 neighbours + self.
+                for oy in range(-1, 2):
+                    for ox in range(-1, 2):
+                        if oy == 0 and ox == 0:
+                            continue
+                        step = math.sqrt(oy * oy + ox * ox)
+                        nd = d_pad[1 + oy:H + 1 + oy, 1 + ox:W + 1 + ox] + step
+                        nw = w_pad[1 + oy:H + 1 + oy, 1 + ox:W + 1 + ox]
+                        closer = nd < dist
+                        dist = torch.where(closer, nd, dist)
+                        w = torch.where(closer, nw, w)
+
+            weight[b] = w.clamp(0.0, 1.0)
+
+        # Smooth the weight map to eliminate Voronoi seams from the
+        # nearest-boundary propagation.  Use a Gaussian whose sigma
+        # scales with blur_radius so the smoothing is proportional
+        # to the blur extent.
+        smooth_sigma = max(1.0, blur_radius * 0.5)
+        smooth_kr = math.ceil(3.0 * smooth_sigma)
+        smooth_size = 2 * smooth_kr + 1
+        ax = torch.arange(smooth_size, dtype=weight.dtype, device=weight.device) - smooth_kr
+        sy, sx = torch.meshgrid(ax, ax, indexing="ij")
+        smooth_kern = torch.exp(-(sx ** 2 + sy ** 2) / (2.0 * smooth_sigma ** 2))
+        smooth_kern = smooth_kern / smooth_kern.sum()
+        smooth_kern = smooth_kern.unsqueeze(0).unsqueeze(0)
+
+        w_4d = F.pad(
+            weight.unsqueeze(1),
+            (smooth_kr, smooth_kr, smooth_kr, smooth_kr),
+            mode="replicate",
+        )
+        weight = F.conv2d(w_4d, smooth_kern, padding=0).squeeze(1)
+        weight = weight.clamp(0.0, 1.0)
+
+        return weight
+
+    # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
 
@@ -182,11 +295,12 @@ class DirectionalBlur:
         self,
         mask: torch.Tensor,
         angle_deg: float,
-        spread_deg: float,
         radius: int,
-        single_pass: bool,
-        soft_cone: bool = True,
+        blend_mode: str = "bbox",
+        falloff: float = 1.0,
+        single_pass: bool = False,
         edge_padding: str = "replicate",
+        sdf_iterations: int = 30,
     ):
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
@@ -209,17 +323,30 @@ class DirectionalBlur:
             r_small = min(r_small, cap)
             passes = [r_small] * n_passes
 
-        result = mask
+        # --- Full omnidirectional Gaussian blur ---
+        blurred = mask
         for r in passes:
-            kernel, kern_radius = self._build_directional_kernel(
-                r, angle_deg, spread_deg, soft_cone,
-            )
+            kernel, kern_radius = self._build_gaussian_kernel(r)
             kernel = kernel.unsqueeze(0).unsqueeze(0).to(
                 mask.device, dtype=mask.dtype,
             )
-            result = self._apply_kernel(
-                result, kernel, kern_radius, edge_padding,
+            blurred = self._apply_kernel(
+                blurred, kernel, kern_radius, edge_padding,
             )
+
+        # --- Directional blend weight ---
+        if blend_mode == "sdf":
+            weight = self._blend_weight_sdf(mask, angle_deg, radius, sdf_iterations)
+        else:
+            weight = self._blend_weight_bbox(mask, angle_deg)
+
+        # Apply falloff curve: >1 steepens (blur concentrates at
+        # leading edge), <1 flattens (blur extends toward trailing).
+        if falloff != 1.0:
+            weight = weight.pow(falloff)
+
+        # Blend: weight=1 → blurred, weight=0 → original.
+        result = weight * blurred + (1.0 - weight) * mask
 
         return (result.clamp(0.0, 1.0),)
 
