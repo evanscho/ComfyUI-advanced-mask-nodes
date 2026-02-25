@@ -103,3 +103,32 @@ def test_presence_threshold_zero_strict(node):
     # Both present → averaged
     expected = (0.005 + 0.8) / 2.0
     assert torch.allclose(result, torch.full((1, 64, 64), expected))
+
+
+def test_blend_threshold_separates_from_presence(node):
+    """Pixels between presence and blend thresholds pass through without blending."""
+    a = torch.zeros(1, 64, 64)
+    b = torch.zeros(1, 64, 64)
+    a[:, :, :] = 0.1   # above presence (0.01), below blend (0.5)
+    b[:, :, :] = 0.8   # above both
+    (result,) = node.average_masks(a, b, presence_threshold=0.01, blend_threshold=0.5)
+    # a is present but not blendable; b is both → no averaging,
+    # both present → take max.
+    assert torch.allclose(result, torch.full((1, 64, 64), 0.8), atol=1e-5)
+
+
+def test_blend_threshold_both_above(node):
+    """Both above blend_threshold → averaged normally."""
+    a = torch.full((1, 64, 64), 0.6)
+    b = torch.full((1, 64, 64), 0.8)
+    (result,) = node.average_masks(a, b, presence_threshold=0.01, blend_threshold=0.5)
+    expected = (0.6 + 0.8) / 2.0
+    assert torch.allclose(result, torch.full((1, 64, 64), expected))
+
+
+def test_blend_threshold_both_below(node):
+    """Both above presence but below blend → takes max (both present, not blended)."""
+    a = torch.full((1, 64, 64), 0.2)
+    b = torch.full((1, 64, 64), 0.3)
+    (result,) = node.average_masks(a, b, presence_threshold=0.01, blend_threshold=0.5)
+    assert torch.allclose(result, torch.full((1, 64, 64), 0.3), atol=1e-5)

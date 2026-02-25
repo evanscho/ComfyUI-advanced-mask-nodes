@@ -78,3 +78,31 @@ def test_already_smooth_gradient(node):
     # Interior should be very close to original (edges may shift slightly).
     interior_diff = (result[0, 10:90, 10:90] - mask[0, 10:90, 10:90]).abs().max().item()
     assert interior_diff < 0.05
+
+
+def test_only_increase_never_dims(node):
+    """With only_increase=True, no pixel should decrease from the original."""
+    mask = torch.zeros(1, 100, 100)
+    mask[:, 40:60, 40:60] = 1.0
+    (result,) = node.smooth_mask(mask, 10, only_increase=True)
+    # Every pixel should be >= original.
+    assert (result >= mask - 1e-6).all()
+
+
+def test_only_increase_fills_dips(node):
+    """With only_increase=True, dips in the mask should get filled in."""
+    mask = torch.ones(1, 100, 100)
+    mask[:, 48:52, 48:52] = 0.0  # small hole
+    (result,) = node.smooth_mask(mask, 20, only_increase=True)
+    # The hole should be partially or fully filled.
+    hole_val = result[0, 50, 50].item()
+    assert hole_val > 0.5
+
+
+def test_only_increase_vs_normal(node):
+    """only_increase result should be >= normal smoothing everywhere."""
+    mask = torch.zeros(1, 100, 100)
+    mask[:, 40:60, 40:60] = 1.0
+    (normal,) = node.smooth_mask(mask, 10, only_increase=False)
+    (increased,) = node.smooth_mask(mask, 10, only_increase=True)
+    assert (increased >= normal - 1e-6).all()
