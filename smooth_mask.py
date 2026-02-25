@@ -24,6 +24,7 @@ class SmoothMask:
                     "INT",
                     {"default": 5, "min": 1, "max": 100, "step": 1},
                 ),
+                "only_increase": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -44,6 +45,7 @@ class SmoothMask:
         self,
         mask: torch.Tensor,
         iterations: int,
+        only_increase: bool = False,
     ):
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
@@ -57,7 +59,11 @@ class SmoothMask:
                 (1, 1, 1, 1),
                 mode="replicate",
             )
-            result = F.conv2d(padded, kernel, padding=0).squeeze(1)
+            smoothed = F.conv2d(padded, kernel, padding=0).squeeze(1)
+            if only_increase:
+                result = torch.maximum(smoothed, result)
+            else:
+                result = smoothed
 
         return (result.clamp(0.0, 1.0),)
 
